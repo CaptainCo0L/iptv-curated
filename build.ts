@@ -40,6 +40,14 @@ const FOLDERS = [
 ]
 const EXCLUDED_CATEGORIES = ['religious', 'shop', 'xxx']
 const FASHION = /\b(fashion|ftv)\b/i
+// Kept whatever their language tag says. FashionTV.in is left out on purpose
+const FASHION_TV = [
+  'FashionTV.ru',
+  'FashionTV.ua',
+  'FashionTVEurope.fr',
+  'FashionTVParisLOriginal.fr',
+  'FashionTVSecrets.fr'
+]
 const SCIENCE =
   /\b(discovery|nat ?geo|national geographic|animal planet|bbc earth|history|smithsonian|love nature)\b/i
 const UHD = /\b(4k|uhd|2160p)\b/i
@@ -239,12 +247,16 @@ async function main() {
     if (channel.categories.some(name => EXCLUDED_CATEGORIES.includes(name))) continue
 
     const feed = feedsById.get(stream.id) ?? mainFeeds.get(channelId)
-    if (channel.country !== 'IN' && !feed?.languages.includes('eng')) {
+    const isFashionTV = FASHION_TV.includes(channelId)
+    if (!isFashionTV && channel.country !== 'IN' && !feed?.languages.includes('eng')) {
       skippedLanguage++
       continue
     }
 
-    add(channelId, getFolder(channel.categories, stream.title, channel.country), stream)
+    const folder = isFashionTV
+      ? 'Travel & Fashion'
+      : getFolder(channel.categories, stream.title, channel.country)
+    add(channelId, folder, stream)
     if (UHD.test(stream.title)) add(`4k:${channelId}`, '4K', stream)
   }
 
