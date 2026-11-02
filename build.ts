@@ -169,6 +169,7 @@ function getFolder(categories: string[], title: string, country: string): string
   if (has('movies', 'classic')) return 'Movies'
   if (has('series')) return 'TV Series'
   if (has('music')) return 'Music'
+  if (has('lifestyle')) return 'Travel & Lifestyle'
 
   return country === 'IN' ? 'Indian' : 'English'
 }
