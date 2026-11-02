@@ -18,6 +18,7 @@ type Channel = {
   closed: string | null
 }
 type Feed = { channel: string; id: string; is_main: boolean; languages: string[] }
+type Logo = { channel: string; feed: string | null; in_use: boolean; format: string; url: string }
 
 const API = 'https://iptv-org.github.io/api'
 const OUTPUT = join(import.meta.dirname, 'playlist.m3u')
@@ -176,19 +177,35 @@ async function fetchJson<T>(name: string): Promise<T> {
   return response.json() as Promise<T>
 }
 
-function toEntry(stream: Stream, folder: string, isBackup: boolean): string {
+// Feed logo first, then the channel's own, then any feed's. SVG is skipped: not safe to assume players draw it
+function indexLogos(logos: Logo[]): Map<string, string> {
+  const usable = logos.filter(logo => logo.in_use && logo.format !== 'SVG')
+  const index = new Map<string, string>()
+  for (const logo of [...usable].sort((a, b) => Number(!!a.feed) - Number(!!b.feed))) {
+    const keys = logo.feed ? [`${logo.channel}@${logo.feed}`, logo.channel] : [logo.channel]
+    for (const key of keys) if (!index.has(key)) index.set(key, logo.url)
+  }
+
+  return index
+}
+
+function toEntry(stream: Stream, folder: string, isBackup: boolean, logos: Map<string, string>): string {
   const title = isBackup ? `${stream.title} - Backup` : stream.title
-  const extinf = `#EXTINF:-1 tvg-id="${stream.id}" group-title="${folder}",${title}`
+  const logo = logos.get(stream.id) ?? logos.get(stream.id.split('@')[0])
+  const logoAttr = logo ? ` tvg-logo="${logo}"` : ''
+  const extinf = `#EXTINF:-1 tvg-id="${stream.id}"${logoAttr} group-title="${folder}",${title}`
   const opts = stream.opts.map(opt => `#EXTVLCOPT:${opt}`)
 
   return [extinf, ...opts, stream.url].join('\n')
 }
 
 async function main() {
-  const [channels, feeds] = await Promise.all([
+  const [channels, feeds, logoList] = await Promise.all([
     fetchJson<Channel[]>('channels'),
-    fetchJson<Feed[]>('feeds')
+    fetchJson<Feed[]>('feeds'),
+    fetchJson<Logo[]>('logos')
   ])
+  const logos = indexLogos(logoList)
   const channelsById = new Map(channels.map(channel => [channel.id, channel]))
   const feedsById = new Map(feeds.map(feed => [`${feed.channel}@${feed.id}`, feed]))
   const mainFeeds = new Map(feeds.filter(feed => feed.is_main).map(feed => [feed.channel, feed]))
@@ -250,7 +267,7 @@ async function main() {
       passed++
       entries.get(group.folder)?.push({
         title: stream.title.toLowerCase() + (found ? ' ~backup' : ''),
-        text: toEntry(stream, group.folder, found > 0)
+        text: toEntry(stream, group.folder, found > 0, logos)
       })
       found++
     }
