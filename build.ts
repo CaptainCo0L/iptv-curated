@@ -31,7 +31,8 @@ const FOLDERS = [
   'Indian',
   'English',
   'Sports',
-  'Travel & Fashion',
+  'Travel & Lifestyle',
+  'Fashion',
   'Science',
   '4K',
   'Movies',
@@ -40,8 +41,9 @@ const FOLDERS = [
 ]
 const EXCLUDED_CATEGORIES = ['religious', 'shop', 'xxx']
 const FASHION = /\b(fashion|ftv)\b/i
-// Kept whatever their language tag says. FashionTV.in is left out on purpose
-const FASHION_TV = [
+// Always in Fashion, whatever their language tag says. FashionTV.in is left out on purpose
+const FASHION_CHANNELS = [
+  'FashionBox.nl',
   'FashionTV.ru',
   'FashionTV.ua',
   'FashionTVEurope.fr',
@@ -161,7 +163,8 @@ function getFolder(categories: string[], title: string, country: string): string
   const has = (...names: string[]) => names.some(name => categories.includes(name))
 
   if (has('sports')) return 'Sports'
-  if (has('travel', 'outdoor') || FASHION.test(title)) return 'Travel & Fashion'
+  if (FASHION.test(title)) return 'Fashion'
+  if (has('travel', 'outdoor')) return 'Travel & Lifestyle'
   if (has('science', 'documentary', 'education') || SCIENCE.test(title)) return 'Science'
   if (has('movies', 'classic')) return 'Movies'
   if (has('series')) return 'TV Series'
@@ -247,15 +250,13 @@ async function main() {
     if (channel.categories.some(name => EXCLUDED_CATEGORIES.includes(name))) continue
 
     const feed = feedsById.get(stream.id) ?? mainFeeds.get(channelId)
-    const isFashionTV = FASHION_TV.includes(channelId)
-    if (!isFashionTV && channel.country !== 'IN' && !feed?.languages.includes('eng')) {
+    const isFashion = FASHION_CHANNELS.includes(channelId)
+    if (!isFashion && channel.country !== 'IN' && !feed?.languages.includes('eng')) {
       skippedLanguage++
       continue
     }
 
-    const folder = isFashionTV
-      ? 'Travel & Fashion'
-      : getFolder(channel.categories, stream.title, channel.country)
+    const folder = isFashion ? 'Fashion' : getFolder(channel.categories, stream.title, channel.country)
     add(channelId, folder, stream)
     if (UHD.test(stream.title)) add(`4k:${channelId}`, '4K', stream)
   }
