@@ -28,6 +28,7 @@ const CONCURRENCY = 75
 const PER_CHANNEL = 2 // best stream plus one backup
 
 const FOLDERS = [
+  'Kerala Vision',
   'Indian',
   'English',
   'Sports',
@@ -53,6 +54,10 @@ const FASHION_CHANNELS = [
 const SCIENCE =
   /\b(discovery|nat ?geo|national geographic|animal planet|bbc earth|history|smithsonian|love nature)\b/i
 const UHD = /\b(4k|uhd|2160p)\b/i
+// Kerala Vision cable lineup (kccl.tv/pdf/FULL-CHANNEL-LIST.pdf), hand-mapped to channel ids.
+// Its channels get a copy in the Kerala Vision folder, ordered by cable channel number
+const KERALA_VISION_FILE = join(import.meta.dirname, 'keralavision.json')
+const KERALA_VISION = 'Kerala Vision'
 
 function parsePlaylist(file: string): Stream[] {
   const streams: Stream[] = []
@@ -121,8 +126,17 @@ function firstUri(manifest: string, base: string, after: string): string | null 
   return uri ? new URL(uri, base).href : null
 }
 
+// Kerala Vision copies share streams with their normal folder, so each URL is tested once
+const playable = new Map<string, Promise<boolean>>()
+function isPlayable(stream: Stream): Promise<boolean> {
+  const cached = playable.get(stream.url) ?? checkPlayable(stream)
+  playable.set(stream.url, cached)
+
+  return cached
+}
+
 // Follows master playlist -> media playlist -> first segment, so a stale manifest fails
-async function isPlayable(stream: Stream): Promise<boolean> {
+async function checkPlayable(stream: Stream): Promise<boolean> {
   const headers = getHeaders(stream)
   try {
     let result = await read(stream.url, headers, 512 * 1024)
@@ -201,11 +215,30 @@ function indexLogos(logos: Logo[]): Map<string, string> {
   return index
 }
 
-function toEntry(stream: Stream, folder: string, isBackup: boolean, logos: Map<string, string>): string {
+// Lowest cable number per channel: Kerala Vision often lists the SD and HD versions separately
+function loadKeralaVision(): Map<string, number> {
+  const lineup: { sid: number; id: string | null }[] = JSON.parse(readFileSync(KERALA_VISION_FILE, 'utf8'))
+  const numbers = new Map<string, number>()
+  for (const { sid, id } of lineup) {
+    const current = id ? numbers.get(id) : undefined
+    if (id && (current === undefined || sid < current)) numbers.set(id, sid)
+  }
+
+  return numbers
+}
+
+function toEntry(
+  stream: Stream,
+  folder: string,
+  isBackup: boolean,
+  logos: Map<string, string>,
+  number?: number
+): string {
   const title = isBackup ? `${stream.title} - Backup` : stream.title
   const logo = logos.get(stream.id) ?? logos.get(stream.id.split('@')[0])
   const logoAttr = logo ? ` tvg-logo="${logo}"` : ''
-  const extinf = `#EXTINF:-1 tvg-id="${stream.id}"${logoAttr} group-title="${folder}",${title}`
+  const numberAttr = number ? ` tvg-chno="${number}"` : ''
+  const extinf = `#EXTINF:-1 tvg-id="${stream.id}"${numberAttr}${logoAttr} group-title="${folder}",${title}`
   const opts = stream.opts.map(opt => `#EXTVLCOPT:${opt}`)
 
   return [extinf, ...opts, stream.url].join('\n')
@@ -218,14 +251,15 @@ async function main() {
     fetchJson<Logo[]>('logos')
   ])
   const logos = indexLogos(logoList)
+  const keralaVision = loadKeralaVision()
   const channelsById = new Map(channels.map(channel => [channel.id, channel]))
   const feedsById = new Map(feeds.map(feed => [`${feed.channel}@${feed.id}`, feed]))
   const mainFeeds = new Map(feeds.filter(feed => feed.is_main).map(feed => [feed.channel, feed]))
 
   const files = readdirSync(STREAMS_DIR).filter(file => file.endsWith('.m3u'))
-  const groups = new Map<string, { folder: string; streams: Stream[] }>()
-  const add = (key: string, folder: string, stream: Stream) => {
-    const group = groups.get(key) ?? { folder, streams: [] }
+  const groups = new Map<string, { folder: string; number?: number; streams: Stream[] }>()
+  const add = (key: string, folder: string, stream: Stream, number?: number) => {
+    const group = groups.get(key) ?? { folder, number, streams: [] }
     if (!group.streams.some(item => item.url === stream.url)) group.streams.push(stream)
     groups.set(key, group)
   }
@@ -249,6 +283,10 @@ async function main() {
 
     if (channel.is_nsfw || channel.closed) continue
     if (channel.categories.some(name => EXCLUDED_CATEGORIES.includes(name))) continue
+
+    // on the cable lineup, so wanted whatever the language
+    const number = keralaVision.get(channelId)
+    if (number) add(`kv:${channelId}`, KERALA_VISION, stream, number)
 
     const feed = feedsById.get(stream.id) ?? mainFeeds.get(channelId)
     const isFashion = FASHION_CHANNELS.includes(channelId)
@@ -279,9 +317,10 @@ async function main() {
       if (tested % 500 === 0) console.log(`tested ${tested}, ${passed} passed`)
       if (!(await isPlayable(stream))) continue
       passed++
+      const sortKey = group.number ? String(group.number).padStart(4, '0') : stream.title.toLowerCase()
       entries.get(group.folder)?.push({
-        title: stream.title.toLowerCase() + (found ? ' ~backup' : ''),
-        text: toEntry(stream, group.folder, found > 0, logos)
+        title: sortKey + (found ? ' ~backup' : ''),
+        text: toEntry(stream, group.folder, found > 0, logos, group.number)
       })
       found++
     }
