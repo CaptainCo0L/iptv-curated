@@ -1,5 +1,8 @@
 // Builds my-playlist/playlist.m3u from ../streams. Run from anywhere with:
-//   node "D:\Claude Apps\iptv\my-playlist\build.ts"
+//   node "D:\Claude Apps\iptv\my-playlist\build.ts" [older-playlist.m3u ...]
+// Channels already in playlist.m3u are kept as they are and never retested, because a stream
+// that fails at one time of day often works at another. Only channels new to the playlist are
+// tested. Older playlists passed as arguments are merged in too, which restores what they had
 import { readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -227,6 +230,64 @@ function loadKeralaVision(): Map<string, number> {
   return numbers
 }
 
+// Matches the group keys built in main, so a kept entry blocks retesting the same channel
+function getKey(id: string, title: string, folder: string): string {
+  const [channelId] = id.split('@')
+  const base = channelId || `untagged:${title.replace(/[([].*$/, '').trim().toLowerCase()}`
+  if (folder === KERALA_VISION) return `kv:${base}`
+  if (folder === '4K') return `4k:${base}`
+
+  return base
+}
+
+type Entry = { key: string; folder: string; sortKey: string; text: string }
+
+function getSortKey(title: string, isBackup: boolean, number?: number): string {
+  return (number ? String(number).padStart(4, '0') : title.toLowerCase()) + (isBackup ? ' ~backup' : '')
+}
+
+// The first file listing a channel wins, so the current playlist beats older ones
+function loadExisting(files: string[]): Entry[] {
+  const entries: Entry[] = []
+  const seen = new Set<string>()
+  for (const file of files) {
+    let lines: string[]
+    try {
+      lines = readFileSync(file, 'utf8').split('\n')
+    } catch {
+      continue
+    }
+    const fromFile: Entry[] = []
+    let block: string[] = []
+    for (const raw of lines) {
+      const line = raw.trimEnd()
+      if (line.startsWith('#EXTINF')) block = [line]
+      else if (line.startsWith('#EXTVLCOPT:') && block.length) block.push(line)
+      else if (line && !line.startsWith('#') && block.length) {
+        const extinf = block[0]
+        const fullTitle = extinf.match(/^#EXTINF:[^,"]*(?:"[^"]*"[^,"]*)*,(.*)$/)?.[1]?.trim() ?? ''
+        const isBackup = fullTitle.endsWith(' - Backup')
+        const title = isBackup ? fullTitle.slice(0, -' - Backup'.length) : fullTitle
+        const folder = extinf.match(/group-title="([^"]*)"/)?.[1] ?? ''
+        const id = extinf.match(/tvg-id="([^"]*)"/)?.[1] ?? ''
+        const number = Number(extinf.match(/tvg-chno="(\d+)"/)?.[1] ?? 0)
+        fromFile.push({
+          key: getKey(id, title, folder),
+          folder,
+          sortKey: getSortKey(title, isBackup, number),
+          text: [...block, line].join('\n')
+        })
+        block = []
+      }
+    }
+    const added = fromFile.filter(entry => !seen.has(entry.key))
+    for (const entry of added) seen.add(entry.key)
+    entries.push(...added)
+  }
+
+  return entries
+}
+
 function toEntry(
   stream: Stream,
   folder: string,
@@ -300,12 +361,19 @@ async function main() {
     if (UHD.test(stream.title)) add(`4k:${channelId}`, '4K', stream)
   }
 
-  const candidates = [...groups.values()]
-  const total = candidates.reduce((sum, group) => sum + group.streams.length, 0)
-  console.log(`${candidates.length} channels, ${total} streams to test`)
-
+  const existing = loadExisting([OUTPUT, ...process.argv.slice(2)])
+  const known = new Set(existing.map(entry => entry.key))
   const entries = new Map<string, { title: string; text: string }[]>()
   for (const folder of FOLDERS) entries.set(folder, [])
+  for (const entry of existing) {
+    if (!entries.has(entry.folder)) entries.set(entry.folder, [])
+    entries.get(entry.folder)?.push({ title: entry.sortKey, text: entry.text })
+  }
+  console.log(`Kept ${known.size} channels (${existing.length} entries) without retesting`)
+
+  const candidates = [...groups].filter(([key]) => !known.has(key)).map(([, group]) => group)
+  const total = candidates.reduce((sum, group) => sum + group.streams.length, 0)
+  console.log(`${candidates.length} new channels, ${total} streams to test`)
 
   let tested = 0
   let passed = 0
@@ -317,26 +385,23 @@ async function main() {
       if (tested % 500 === 0) console.log(`tested ${tested}, ${passed} passed`)
       if (!(await isPlayable(stream))) continue
       passed++
-      const sortKey = group.number ? String(group.number).padStart(4, '0') : stream.title.toLowerCase()
       entries.get(group.folder)?.push({
-        title: sortKey + (found ? ' ~backup' : ''),
+        title: getSortKey(stream.title, found > 0, group.number),
         text: toEntry(stream, group.folder, found > 0, logos, group.number)
       })
       found++
     }
   })
 
-  const body = FOLDERS.flatMap(folder =>
-    (entries.get(folder) ?? [])
-      .sort((a, b) => a.title.localeCompare(b.title))
-      .map(entry => entry.text)
+  const body = [...entries.values()].flatMap(list =>
+    list.sort((a, b) => a.title.localeCompare(b.title)).map(entry => entry.text)
   )
   writeFileSync(`${OUTPUT}.tmp`, ['#EXTM3U', ...body, ''].join('\n'))
   renameSync(`${OUTPUT}.tmp`, OUTPUT)
 
   for (const folder of FOLDERS) console.log(`${folder}: ${entries.get(folder)?.length}`)
   console.log(`Skipped outside India/English scope: ${skippedLanguage}`)
-  console.log(`Tested ${tested}, kept ${passed}. Wrote ${OUTPUT}`)
+  console.log(`Tested ${tested}, added ${passed}. Wrote ${OUTPUT}`)
 }
 
 main()
