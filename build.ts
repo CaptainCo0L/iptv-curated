@@ -1,10 +1,29 @@
 // Builds my-playlist/playlist.m3u from ../streams. Run from anywhere with:
 //   node "D:\Claude Apps\iptv\my-playlist\build.ts" [older-playlist.m3u ...]
-// Channels already in playlist.m3u are kept as they are and never retested, because a stream
-// that fails at one time of day often works at another. Only channels new to the playlist are
-// tested. Older playlists passed as arguments are merged in too, which restores what they had
+//   node "D:\Claude Apps\iptv\my-playlist\build.ts" --probe-only
+// Channels already in playlist.m3u are kept and never retested to decide whether they stay,
+// because a stream that fails at one time of day often works at another. Only channels new to the
+// playlist are tested before being added. Older playlists passed as arguments are merged in too.
+// --probe-only (scheduled 3 times a day) tests every URL in the playlist and records the results
+// in probe-history.json. History only picks which stream is the main row and feeds dead-report.txt.
+// Backup rows live in the Backups folder; each channel keeps its main row in its own folder.
 import { readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import {
+  BACKUPS,
+  KERALA_VISION,
+  UHD_FOLDER,
+  format,
+  groupKey,
+  key,
+  parseFile,
+  resolution,
+  sortKey,
+  titleOf,
+  type Entry
+} from './entry.ts'
+import { type Run, appendHistory, beats, isDead, loadHistory, withoutDnsOutages } from './history.ts'
+import { createProber } from './probe.ts'
 
 type Stream = {
   id: string
@@ -25,23 +44,25 @@ type Logo = { channel: string; feed: string | null; in_use: boolean; format: str
 
 const API = 'https://iptv-org.github.io/api'
 const OUTPUT = join(import.meta.dirname, 'playlist.m3u')
+const HISTORY_FILE = join(import.meta.dirname, 'probe-history.json')
+const DEAD_REPORT = join(import.meta.dirname, 'dead-report.txt')
 const STREAMS_DIR = join(import.meta.dirname, '..', 'streams')
-const TIMEOUT = 20000
-const CONCURRENCY = 75
 const PER_CHANNEL = 2 // best stream plus one backup
 
 const FOLDERS = [
-  'Kerala Vision',
+  KERALA_VISION,
   'Indian',
   'English',
+  'News',
   'Sports',
   'Travel & Lifestyle',
   'Fashion',
   'Science',
-  '4K',
+  UHD_FOLDER,
   'Movies',
   'TV Series',
-  'Music'
+  'Music',
+  BACKUPS
 ]
 const EXCLUDED_CATEGORIES = ['religious', 'shop', 'xxx']
 const FASHION = /\b(fashion|ftv)\b/i
@@ -60,7 +81,19 @@ const UHD = /\b(4k|uhd|2160p)\b/i
 // Kerala Vision cable lineup (kccl.tv/pdf/FULL-CHANNEL-LIST.pdf), hand-mapped to channel ids.
 // Its channels get a copy in the Kerala Vision folder, ordered by cable channel number
 const KERALA_VISION_FILE = join(import.meta.dirname, 'keralavision.json')
-const KERALA_VISION = 'Kerala Vision'
+
+// Every probe result of this run, written to the history at the end
+const prober = createProber()
+const runs = new Map<string, Run>()
+async function test(stream: { url: string; opts: string[] }): Promise<boolean> {
+  const result = await prober.probe(stream)
+  if (!runs.has(stream.url)) {
+    runs.set(stream.url, { t: new Date().toISOString(), ...result })
+    if (runs.size % 500 === 0) console.log(`tested ${runs.size}`)
+  }
+
+  return result.ok
+}
 
 function parsePlaylist(file: string): Stream[] {
   const streams: Stream[] = []
@@ -70,8 +103,7 @@ function parsePlaylist(file: string): Stream[] {
   for (const raw of readFileSync(join(STREAMS_DIR, file), 'utf8').split('\n')) {
     const line = raw.trim()
     if (line.startsWith('#EXTINF')) {
-      const title = line.match(/^#EXTINF:[^,"]*(?:"[^"]*"[^,"]*)*,(.*)$/)?.[1] ?? ''
-      entry = { id: line.match(/tvg-id="([^"]*)"/)?.[1] ?? '', title: title.trim(), opts: [] }
+      entry = { id: line.match(/tvg-id="([^"]*)"/)?.[1] ?? '', title: titleOf(line), opts: [] }
     } else if (line.startsWith('#EXTVLCOPT:') && entry) {
       // some entries repeat the prefix: #EXTVLCOPT:http-user-agent=#EXTVLCOPT:http-user-agent=...
       entry.opts.push(line.slice(line.lastIndexOf('#EXTVLCOPT:') + '#EXTVLCOPT:'.length))
@@ -84,91 +116,10 @@ function parsePlaylist(file: string): Stream[] {
   return streams
 }
 
-function getHeaders(stream: Stream): Record<string, string> {
-  const headers: Record<string, string> = { 'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20' }
-  for (const opt of stream.opts) {
-    const separator = opt.indexOf('=')
-    const value = opt.slice(separator + 1)
-    if (opt.startsWith('http-user-agent')) headers['User-Agent'] = value
-    if (opt.startsWith('http-referrer')) headers['Referer'] = value
-  }
-
-  return headers
-}
-
-async function read(url: string, headers: Record<string, string>, limit: number) {
-  const signal = AbortSignal.timeout(TIMEOUT)
-  const response = await fetch(url, { headers, signal })
-  if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
-
-  const chunks: Uint8Array[] = []
-  let size = 0
-  const reader = response.body.getReader()
-  while (size < limit) {
-    const { done, value } = await reader.read()
-    if (done) break
-    chunks.push(value)
-    size += value.length
-  }
-  await reader.cancel().catch(() => {})
-
-  return {
-    url: response.url,
-    type: response.headers.get('content-type') ?? '',
-    size,
-    text: Buffer.concat(chunks).toString('latin1')
-  }
-}
-
-function firstUri(manifest: string, base: string, after: string): string | null {
-  const lines = manifest.split('\n').map(line => line.trim())
-  const index = lines.findIndex(line => line.startsWith(after))
-  if (index < 0) return null
-  const uri = lines.slice(index + 1).find(line => line && !line.startsWith('#'))
-
-  return uri ? new URL(uri, base).href : null
-}
-
-// Kerala Vision copies share streams with their normal folder, so each URL is tested once
-const playable = new Map<string, Promise<boolean>>()
-function isPlayable(stream: Stream): Promise<boolean> {
-  const cached = playable.get(stream.url) ?? checkPlayable(stream)
-  playable.set(stream.url, cached)
-
-  return cached
-}
-
-// Follows master playlist -> media playlist -> first segment, so a stale manifest fails
-async function checkPlayable(stream: Stream): Promise<boolean> {
-  const headers = getHeaders(stream)
-  try {
-    let result = await read(stream.url, headers, 512 * 1024)
-    if (result.text.startsWith('#EXTM3U')) {
-      const variant = firstUri(result.text, result.url, '#EXT-X-STREAM-INF')
-      if (variant) result = await read(variant, headers, 512 * 1024)
-      if (/#EXT-X-(SESSION-)?KEY:.*METHOD=SAMPLE-AES/.test(result.text)) return false
-      const segment = firstUri(result.text, result.url, '#EXTINF')
-      if (!segment) return false
-      const first = await read(segment, headers, 4096)
-
-      return first.size > 0 && !first.type.includes('text/html')
-    }
-    if (result.text.includes('<MPD')) return !result.text.includes('<ContentProtection')
-
-    return result.size > 0 && !result.type.includes('text/html')
-  } catch {
-    return false
-  }
-}
-
-function getResolution(title: string): number {
-  return Number(title.match(/\((\d+)[pi]\)/)?.[1] ?? 0)
-}
-
 function rank(a: Stream, b: Stream): number {
   const score = (stream: Stream) => [
     Number(stream.title.includes('Not 24/7')),
-    -getResolution(stream.title),
+    -resolution(stream.title),
     Number(stream.url.startsWith('http://'))
   ]
   const [left, right] = [score(a), score(b)]
@@ -187,16 +138,9 @@ function getFolder(categories: string[], title: string, country: string): string
   if (has('series')) return 'TV Series'
   if (has('music')) return 'Music'
   if (has('lifestyle')) return 'Travel & Lifestyle'
+  if (has('news')) return 'News'
 
   return country === 'IN' ? 'Indian' : 'English'
-}
-
-async function pool<T>(items: T[], worker: (item: T) => Promise<void>) {
-  let next = 0
-  const run = async () => {
-    while (next < items.length) await worker(items[next++])
-  }
-  await Promise.all(Array.from({ length: CONCURRENCY }, run))
 }
 
 async function fetchJson<T>(name: string): Promise<T> {
@@ -230,82 +174,96 @@ function loadKeralaVision(): Map<string, number> {
   return numbers
 }
 
-// Matches the group keys built in main, so a kept entry blocks retesting the same channel
-function getKey(id: string, title: string, folder: string): string {
-  const [channelId] = id.split('@')
-  const base = channelId || `untagged:${title.replace(/[([].*$/, '').trim().toLowerCase()}`
-  if (folder === KERALA_VISION) return `kv:${base}`
-  if (folder === '4K') return `4k:${base}`
-
-  return base
-}
-
-type Entry = { key: string; folder: string; sortKey: string; text: string }
-
-function getSortKey(title: string, isBackup: boolean, number?: number): string {
-  return (number ? String(number).padStart(4, '0') : title.toLowerCase()) + (isBackup ? ' ~backup' : '')
-}
-
 // The first file listing a channel wins, so the current playlist beats older ones
 function loadExisting(files: string[]): Entry[] {
   const entries: Entry[] = []
   const seen = new Set<string>()
   for (const file of files) {
-    let lines: string[]
+    let text: string
     try {
-      lines = readFileSync(file, 'utf8').split('\n')
+      text = readFileSync(file, 'utf8')
     } catch {
       continue
     }
-    const fromFile: Entry[] = []
-    let block: string[] = []
-    for (const raw of lines) {
-      const line = raw.trimEnd()
-      if (line.startsWith('#EXTINF')) block = [line]
-      else if (line.startsWith('#EXTVLCOPT:') && block.length) block.push(line)
-      else if (line && !line.startsWith('#') && block.length) {
-        const extinf = block[0]
-        const fullTitle = extinf.match(/^#EXTINF:[^,"]*(?:"[^"]*"[^,"]*)*,(.*)$/)?.[1]?.trim() ?? ''
-        const isBackup = fullTitle.endsWith(' - Backup')
-        const title = isBackup ? fullTitle.slice(0, -' - Backup'.length) : fullTitle
-        const folder = extinf.match(/group-title="([^"]*)"/)?.[1] ?? ''
-        const id = extinf.match(/tvg-id="([^"]*)"/)?.[1] ?? ''
-        const number = Number(extinf.match(/tvg-chno="(\d+)"/)?.[1] ?? 0)
-        fromFile.push({
-          key: getKey(id, title, folder),
-          folder,
-          sortKey: getSortKey(title, isBackup, number),
-          text: [...block, line].join('\n')
-        })
-        block = []
-      }
-    }
-    const added = fromFile.filter(entry => !seen.has(entry.key))
-    for (const entry of added) seen.add(entry.key)
-    entries.push(...added)
+    const fromFile = parseFile(text).filter(entry => !seen.has(key(entry)))
+    for (const entry of fromFile) seen.add(key(entry))
+    entries.push(...fromFile)
   }
 
   return entries
 }
 
-function toEntry(
-  stream: Stream,
-  folder: string,
-  isBackup: boolean,
-  logos: Map<string, string>,
-  number?: number
-): string {
-  const title = isBackup ? `${stream.title} - Backup` : stream.title
-  const logo = logos.get(stream.id) ?? logos.get(stream.id.split('@')[0])
-  const logoAttr = logo ? ` tvg-logo="${logo}"` : ''
-  const numberAttr = number ? ` tvg-chno="${number}"` : ''
-  const extinf = `#EXTINF:-1 tvg-id="${stream.id}"${numberAttr}${logoAttr} group-title="${folder}",${title}`
-  const opts = stream.opts.map(opt => `#EXTVLCOPT:${opt}`)
+// One main row per channel in each folder; every other row of the channel goes to Backups.
+// A backup that beats the main row (more reliable, or higher resolution) swaps places with it.
+// Rows only move: none is added or dropped here
+function placeBackups(entries: Entry[], keralaVision: Map<string, number>): string[] {
+  const history = withoutDnsOutages(loadHistory(HISTORY_FILE))
+  const log: string[] = []
+  const groups = new Map<string, Entry[]>()
+  for (const entry of entries) groups.set(key(entry), [...(groups.get(key(entry)) ?? []), entry])
 
-  return [extinf, ...opts, stream.url].join('\n')
+  const promote = (entry: Entry) => {
+    entry.isBackup = false
+    entry.folder = entry.home
+    if (entry.home === KERALA_VISION) entry.number = keralaVision.get(entry.id.split('@')[0]) ?? entry.number
+  }
+  const demote = (entry: Entry) => {
+    entry.isBackup = true
+    entry.folder = BACKUPS
+    delete entry.number
+  }
+
+  for (const rows of groups.values()) {
+    for (const row of rows) if (row.isBackup) demote(row)
+    const current = rows.find(row => !row.isBackup)
+    const backups = rows.filter(row => row.isBackup)
+    if (!current) {
+      // a channel whose only rows were backups: its best one becomes the main row
+      const best = backups.reduce((a, b) => (beats(b, a, history) ? b : a))
+      promote(best)
+      log.push(`${best.title} [${best.home}]: only backups, one promoted`)
+      continue
+    }
+    let best = current
+    let why: string | null = null
+    for (const backup of backups) {
+      const reason = beats(backup, best, history)
+      if (reason) [best, why] = [backup, reason]
+    }
+    if (best === current) continue
+    promote(best)
+    demote(current)
+    log.push(`${best.title} [${best.home}]: backup promoted (${why})`)
+  }
+
+  return log
 }
 
-async function main() {
+function writeDeadReport(entries: Entry[]) {
+  const history = withoutDnsOutages(loadHistory(HISTORY_FILE))
+  const lines = entries
+    .filter(entry => isDead(history[entry.url]))
+    .map(entry => {
+      const results = history[entry.url]
+      const title = entry.isBackup ? `${entry.title} - Backup` : entry.title
+      return `${entry.folder}\t${title}\t${results.length} tests, last: ${results.at(-1)?.reason}\t${entry.url}`
+    })
+  const header = '# Failed every test, at least 6 tests over at least 7 days. Report only: nothing is removed.'
+  writeFileSync(DEAD_REPORT, [header, ...lines, ''].join('\n'))
+  console.log(`Dead report: ${lines.length} rows -> ${DEAD_REPORT}`)
+}
+
+async function probeOnly() {
+  const entries = parseFile(readFileSync(OUTPUT, 'utf8'))
+  const unique = [...new Map(entries.map(entry => [entry.url, entry])).values()]
+  console.log(`${new Date().toISOString()} probing ${unique.length} URLs`)
+  const results = await Promise.all(unique.map(test))
+  appendHistory(HISTORY_FILE, [...runs])
+  console.log(`${results.filter(Boolean).length} of ${unique.length} passed. History: ${HISTORY_FILE}`)
+  writeDeadReport(entries)
+}
+
+async function build(olderPlaylists: string[]) {
   const [channels, feeds, logoList] = await Promise.all([
     fetchJson<Channel[]>('channels'),
     fetchJson<Feed[]>('feeds'),
@@ -319,10 +277,11 @@ async function main() {
 
   const files = readdirSync(STREAMS_DIR).filter(file => file.endsWith('.m3u'))
   const groups = new Map<string, { folder: string; number?: number; streams: Stream[] }>()
-  const add = (key: string, folder: string, stream: Stream, number?: number) => {
-    const group = groups.get(key) ?? { folder, number, streams: [] }
+  const add = (folder: string, stream: Stream, number?: number) => {
+    const groupId = groupKey(folder, stream.id, stream.title)
+    const group = groups.get(groupId) ?? { folder, number, streams: [] }
     if (!group.streams.some(item => item.url === stream.url)) group.streams.push(stream)
-    groups.set(key, group)
+    groups.set(groupId, group)
   }
 
   let skippedLanguage = 0
@@ -331,14 +290,15 @@ async function main() {
     const channel = channelsById.get(channelId)
 
     if (!channel) {
-      // no metadata to classify by, so only the Indian files can be trusted for scope
+      // no metadata to classify by, so only the Indian files can be trusted for scope.
+      // Grouped by the id the row is written with (by name when it has none), so the key read
+      // back from the playlist matches and the channel is not retested on the next build
       if (!stream.isIndianFile) {
         skippedLanguage++
         continue
       }
-      const name = stream.title.replace(/[([].*$/, '').trim().toLowerCase()
-      add(`untagged:${name}`, 'Indian', stream)
-      if (UHD.test(stream.title)) add(`4k:untagged:${name}`, '4K', stream)
+      add('Indian', stream)
+      if (UHD.test(stream.title)) add(UHD_FOLDER, stream)
       continue
     }
 
@@ -347,7 +307,7 @@ async function main() {
 
     // on the cable lineup, so wanted whatever the language
     const number = keralaVision.get(channelId)
-    if (number) add(`kv:${channelId}`, KERALA_VISION, stream, number)
+    if (number) add(KERALA_VISION, stream, number)
 
     const feed = feedsById.get(stream.id) ?? mainFeeds.get(channelId)
     const isFashion = FASHION_CHANNELS.includes(channelId)
@@ -357,51 +317,73 @@ async function main() {
     }
 
     const folder = isFashion ? 'Fashion' : getFolder(channel.categories, stream.title, channel.country)
-    add(channelId, folder, stream)
-    if (UHD.test(stream.title)) add(`4k:${channelId}`, '4K', stream)
+    add(folder, stream)
+    if (UHD.test(stream.title)) add(UHD_FOLDER, stream)
   }
 
-  const existing = loadExisting([OUTPUT, ...process.argv.slice(2)])
-  const known = new Set(existing.map(entry => entry.key))
-  const entries = new Map<string, { title: string; text: string }[]>()
-  for (const folder of FOLDERS) entries.set(folder, [])
+  const existing = loadExisting([OUTPUT, ...olderPlaylists])
+  // Kept channels that only landed in Indian/English for want of a News folder move into it
+  // without a retest
+  let movedToNews = 0
   for (const entry of existing) {
-    if (!entries.has(entry.folder)) entries.set(entry.folder, [])
-    entries.get(entry.folder)?.push({ title: entry.sortKey, text: entry.text })
+    if (entry.home !== 'Indian' && entry.home !== 'English') continue
+    const channel = channelsById.get(entry.id.split('@')[0])
+    if (!channel?.categories.includes('news')) continue
+    if (getFolder(channel.categories, entry.title, channel.country) !== 'News') continue
+    if (entry.folder === entry.home) entry.folder = 'News'
+    entry.home = 'News'
+    movedToNews++
   }
+  if (movedToNews) console.log(`Moved ${movedToNews} kept entries into News`)
+  const known = new Set(existing.map(key))
   console.log(`Kept ${known.size} channels (${existing.length} entries) without retesting`)
 
-  const candidates = [...groups].filter(([key]) => !known.has(key)).map(([, group]) => group)
+  const candidates = [...groups].filter(([groupId]) => !known.has(groupId)).map(([, group]) => group)
   const total = candidates.reduce((sum, group) => sum + group.streams.length, 0)
   console.log(`${candidates.length} new channels, ${total} streams to test`)
 
-  let tested = 0
-  let passed = 0
-  await pool(candidates, async group => {
-    let found = 0
-    for (const stream of group.streams.sort(rank)) {
-      if (found === PER_CHANNEL) break
-      tested++
-      if (tested % 500 === 0) console.log(`tested ${tested}, ${passed} passed`)
-      if (!(await isPlayable(stream))) continue
-      passed++
-      entries.get(group.folder)?.push({
-        title: getSortKey(stream.title, found > 0, group.number),
-        text: toEntry(stream, group.folder, found > 0, logos, group.number)
-      })
-      found++
-    }
-  })
+  const added: Entry[] = []
+  await Promise.all(
+    candidates.map(async group => {
+      let found = 0
+      for (const stream of group.streams.sort(rank)) {
+        if (found === PER_CHANNEL) break
+        if (!(await test(stream))) continue
+        added.push({
+          id: stream.id,
+          folder: group.folder,
+          home: group.folder,
+          title: stream.title,
+          isBackup: found > 0,
+          number: group.number,
+          logo: logos.get(stream.id) ?? logos.get(stream.id.split('@')[0]),
+          opts: stream.opts,
+          url: stream.url
+        })
+        found++
+      }
+    })
+  )
 
-  const body = [...entries.values()].flatMap(list =>
-    list.sort((a, b) => a.title.localeCompare(b.title)).map(entry => entry.text)
+  const all = [...existing, ...added]
+  const swaps = placeBackups(all, keralaVision)
+  for (const line of swaps) console.log(line)
+
+  const byFolder = new Map<string, Entry[]>(FOLDERS.map(folder => [folder, []]))
+  for (const entry of all) byFolder.set(entry.folder, [...(byFolder.get(entry.folder) ?? []), entry])
+  const body = [...byFolder.values()].flatMap(list =>
+    list.sort((a, b) => sortKey(a).localeCompare(sortKey(b))).map(format)
   )
   writeFileSync(`${OUTPUT}.tmp`, ['#EXTM3U', ...body, ''].join('\n'))
   renameSync(`${OUTPUT}.tmp`, OUTPUT)
+  appendHistory(HISTORY_FILE, [...runs])
 
-  for (const folder of FOLDERS) console.log(`${folder}: ${entries.get(folder)?.length}`)
+  for (const folder of FOLDERS) console.log(`${folder}: ${byFolder.get(folder)?.length}`)
   console.log(`Skipped outside India/English scope: ${skippedLanguage}`)
-  console.log(`Tested ${tested}, added ${passed}. Wrote ${OUTPUT}`)
+  console.log(`Tested ${runs.size}, added ${added.length}, ${swaps.length} main/backup changes. Wrote ${OUTPUT}`)
+  writeDeadReport(all)
 }
 
-main()
+const args = process.argv.slice(2)
+if (args.includes('--probe-only')) await probeOnly()
+else await build(args)
